@@ -2,343 +2,380 @@ import os
 import torch
 torch.backends.cudnn.benchmark = False
 torch.set_grad_enabled(False)
+import gc
 import numpy as np
 import warnings
-warnings.filterwarnings('ignore')
-from tqdm.auto import tqdm
+warnings.filterwarnings("ignore")
+
 from PIL import Image
 import gradio as gr
-import shutil
 import uuid
 from diffusers import AutoPipelineForText2Image
-from latentblending.blending_engine import BlendingEngine
+from blending_engine import BlendingEngine
 import datetime
 import tempfile
 import json
 from lunar_tools import concatenate_movies
 import argparse
 
-"""
-TODO
-- time per segment
-- init phase (model, res, nmb iter)
-- recycle existing movies
-- hf spaces integration
-"""
 
-class MultiUserRouter():
-    def __init__(
-            self,
-            do_compile=False
-        ):
-        self.user_blendingvariableholder = {}
+# =========================
+# MultiUserRouter
+# =========================
+
+class MultiUserRouter:
+    def __init__(self, do_compile=False):
         self.do_compile = do_compile
-        self.list_models = ["stabilityai/sdxl-turbo", "stabilityai/stable-diffusion-xl-base-1.0"]
 
-        self.init_models()
+        self.list_models = [
+            "segmind/SSD-1B",             # Distilled SDXL (Recommended)
+            "stabilityai/sdxl-turbo",     # Fast SDXL
+            "runwayml/stable-diffusion-v1-5" # Original small model
+        ]
 
-    def init_models(self):
-        self.dict_blendingengines = {}
-        for m in self.list_models:
-            pipe = AutoPipelineForText2Image.from_pretrained(m, torch_dtype=torch.float16, variant="fp16")
-            pipe.to("cuda")
-            be = BlendingEngine(pipe, do_compile=self.do_compile)
+        self.user_blendingvariableholder = {}
+
+        # single-GPU state
+        self.current_pipe = None
+        self.current_model = None
+        self.current_be = None
+
+    # ---------- GPU model management ----------
+    def load_model(self, model):
+        if self.current_model == model:
+            return self.current_be
+
+        # unload previous model
+        if self.current_pipe is not None:
+            del self.current_pipe
+            del self.current_be
+            self.current_pipe = None
+            self.current_be = None
+            gc.collect()           # Force Python to clear RAM
+            torch.cuda.empty_cache() # Force GPU to clear VRAM
             
-            self.dict_blendingengines[m] = be
+        pipe = AutoPipelineForText2Image.from_pretrained(
+            model,
+            torch_dtype=torch.float16,
+            variant="fp16", # Use the smaller fp16 weights
+            use_safetensors=True
+        )
 
+        # Optimization: Move model parts to CPU when not in use
+        # This is the "OOM Killer" fix. 
+        # Do NOT use pipe.to("cuda") if you use this.
+
+        # REPLACE enable_model_cpu_offload() with this:
+        pipe.enable_sequential_cpu_offload()
+        
+        pipe.enable_attention_slicing()
+        
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+        except Exception:
+            pass
+            
+        pipe.vae.enable_tiling()
+
+        be = BlendingEngine(pipe, do_compile=self.do_compile)
+
+        self.current_pipe = pipe
+        self.current_model = model
+        self.current_be = be
+
+        return be
+
+    # ---------- helpers ----------
+    def _get_holder_and_be(self, user_id):
+        holder = self.user_blendingvariableholder[user_id]
+        be = self.load_model(holder.model)
+        holder.be = be
+        return holder
+
+    # ---------- user ----------
     def register_new_user(self, model, width, height):
-        user_id = str(uuid.uuid4().hex.upper()[0:8])
-        be = self.dict_blendingengines[model]
+        user_id = uuid.uuid4().hex[:8].upper()
+
+        be = self.load_model(model)
         be.set_dimensions((width, height))
-        self.user_blendingvariableholder[user_id] = BlendingVariableHolder(be)
+
+        holder = BlendingVariableHolder(model)
+        holder.be = be
+        self.user_blendingvariableholder[user_id] = holder
+
         return user_id
 
-    def user_overflow_protection(self):
-        pass
+    # ---------- UI callbacks ----------
+    def preview_img_selected(self, data, user_id):
+        self.user_blendingvariableholder[user_id].preview_img_selected(data)
+        return None
 
-    def preview_img_selected(self, user_id, data: gr.SelectData, button):
-        return self.user_blendingvariableholder[user_id].preview_img_selected(data, button)
+    def movie_img_selected(self, data, user_id):
+        self.user_blendingvariableholder[user_id].movie_img_selected(data)
+        return None
 
-    def movie_img_selected(self, user_id, data: gr.SelectData, button):
-        return self.user_blendingvariableholder[user_id].movie_img_selected(data, button)
 
     def compute_imgs(self, user_id, prompt, negative_prompt):
-        return self.user_blendingvariableholder[user_id].compute_imgs(prompt, negative_prompt)
-    
-    def get_list_images_movie(self, user_id):
-        return self.user_blendingvariableholder[user_id].get_list_images_movie()
-    
-    def init_new_movie(self, user_id):
-        return self.user_blendingvariableholder[user_id].init_new_movie()
-    
-    def write_json(self, user_id):
-        return self.user_blendingvariableholder[user_id].write_json()
-    
+        holder = self._get_holder_and_be(user_id)
+        return holder.compute_imgs(prompt, negative_prompt)
+
     def add_image_to_video(self, user_id):
-        return self.user_blendingvariableholder[user_id].add_image_to_video()
-    
+        holder = self._get_holder_and_be(user_id)
+        return holder.add_image_to_video()
+
     def img_movie_delete(self, user_id):
         return self.user_blendingvariableholder[user_id].img_movie_delete()
-    
+
     def img_movie_later(self, user_id):
         return self.user_blendingvariableholder[user_id].img_movie_later()
-    
+
     def img_movie_earlier(self, user_id):
         return self.user_blendingvariableholder[user_id].img_movie_earlier()
-    
+
     def generate_movie(self, user_id, t_per_segment):
-        return self.user_blendingvariableholder[user_id].generate_movie(t_per_segment)
+        holder = self._get_holder_and_be(user_id)
+        return holder.generate_movie(t_per_segment)
 
-#%% BlendingVariableHolder Class
-class BlendingVariableHolder():
-    def __init__(
-            self,
-            be):
-        r"""
-        Gradio Helper Class to collect UI data and start latent blending.
-        Args:
-            be:
-                Blendingengine
-            share: bool
-                Set true to get a shareable gradio link (e.g. for running a remote server)
-        """
-        self.be = be
 
-        # UI Defaults
-        self.seed1 = 420
-        self.seed2 = 420
-        self.prompt1 = ""
-        self.prompt2 = ""
-        self.negative_prompt = ""
-        self.nmb_preview_images = 4
+# =========================
+# BlendingVariableHolder
+# =========================
 
-        # Vars
+class BlendingVariableHolder:
+    def __init__(self, model):
+        self.model = model
+        self.be = None
+
         self.prompt = None
         self.negative_prompt = None
-        self.list_seeds = []
-        self.idx_movie = 0
+
+        self.nmb_preview_images = 4
         self.list_seeds = []
         self.list_images_preview = []
-        self.data = []
+
         self.idx_img_preview_selected = None
         self.idx_img_movie_selected = None
-        self.jpg_quality = 80 
-        self.fp_movie = ''
 
-    def preview_img_selected(self, data: gr.SelectData, button):
+        self.data = []
+        self.idx_movie = 0
+
+        self.jpg_quality = 80
+        self.fp_movie = ""
+        self.fp_json = ""
+
+    # ---------- selection ----------
+    def preview_img_selected(self, data):
         self.idx_img_preview_selected = data.index
-        print(f"preview image {self.idx_img_preview_selected} selected, seed {self.list_seeds[self.idx_img_preview_selected]}")
 
-    def movie_img_selected(self, data: gr.SelectData, button):
+    def movie_img_selected(self, data):
         self.idx_img_movie_selected = data.index
-        print(f"movie image {self.idx_img_movie_selected} selected")
 
+    # ---------- generation ----------
     def compute_imgs(self, prompt, negative_prompt):
         self.prompt = prompt
         self.negative_prompt = negative_prompt
+
         self.be.set_prompt1(prompt)
         self.be.set_prompt2(prompt)
         self.be.set_negative_prompt(negative_prompt)
-        self.list_seeds = []
-        self.list_images_preview = []
+
+        self.list_seeds.clear()
+        self.list_images_preview.clear()
         self.idx_img_preview_selected = None
-        for i in range(self.nmb_preview_images):
+
+        for _ in range(self.nmb_preview_images):
             seed = np.random.randint(0, np.iinfo(np.int32).max)
             self.be.seed1 = seed
             self.list_seeds.append(seed)
+
             img = self.be.compute_latents1(return_image=True)
-            fn_img_tmp = f"image_{uuid.uuid4()}.jpg"
-            temp_img_path = os.path.join(tempfile.gettempdir(), fn_img_tmp)
-            img.save(temp_img_path)
-            img.save(temp_img_path, quality=self.jpg_quality, optimize=True)
-            self.list_images_preview.append(temp_img_path)
-        return self.list_images_preview 
-    
 
-    def get_list_images_movie(self):
-        return [entry["preview_image"] for entry in self.data]
+            fn = f"image_{uuid.uuid4().hex}.jpg"
+            path = os.path.join(tempfile.gettempdir(), fn)
+            img.save(path, quality=self.jpg_quality, optimize=True)
 
+            self.list_images_preview.append(path)
 
+        return self.list_images_preview
+
+    # ---------- movie ----------
     def init_new_movie(self):
-        current_time = datetime.datetime.now()
-        self.fp_movie = "movie_" + current_time.strftime("%y%m%d_%H%M") + ".mp4"
-        self.fp_json = "movie_" + current_time.strftime("%y%m%d_%H%M") + ".json"
-        
+        t = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
+        self.fp_movie = f"movie_{t}.mp4"
+        self.fp_json = f"movie_{t}.json"
 
     def write_json(self):
-        # Write the data list to a JSON file
         data_copy = self.data.copy()
-        data_copy.insert(0, {"settings": "sdxl", "width": self.be.dh.width_img, "height": self.be.dh.height_img, "num_inference_steps": self.be.dh.num_inference_steps})
-        with open(self.fp_json, 'w') as f:
-            json.dump(data_copy, f, indent=4)
+        data_copy.insert(
+            0,
+            {
+                "settings": "sdxl",
+                "width": self.be.dh.width_img,
+                "height": self.be.dh.height_img,
+                "num_inference_steps": self.be.dh.num_inference_steps,
+            },
+        )
+        with open(self.fp_json, "w") as f:
+            json.dump(data_copy, f, indent=2)
 
     def add_image_to_video(self):
-        if self.prompt is None:
-            print("Cannot take because no prompt was set!")
+        if self.prompt is None or self.idx_img_preview_selected is None:
             return self.get_list_images_movie()
+
         if self.idx_movie == 0:
             self.init_new_movie()
 
-        self.data.append({"iteration": self.idx_movie, 
-        "seed": self.list_seeds[self.idx_img_preview_selected], 
-        "prompt": self.prompt, 
-        "negative_prompt": self.negative_prompt,
-        "preview_image": self.list_images_preview[self.idx_img_preview_selected]
-        })
+        self.data.append(
+            {
+                "iteration": self.idx_movie,
+                "seed": self.list_seeds[self.idx_img_preview_selected],
+                "prompt": self.prompt,
+                "negative_prompt": self.negative_prompt,
+                "preview_image": self.list_images_preview[self.idx_img_preview_selected],
+            }
+        )
 
         self.write_json()
         self.idx_movie += 1
         return self.get_list_images_movie()
 
+    def get_list_images_movie(self):
+        return [d["preview_image"] for d in self.data]
+
     def img_movie_delete(self):
-        if self.idx_img_movie_selected is not None and 0 <= self.idx_img_movie_selected < len(self.data)+1:
+        if (
+            self.idx_img_movie_selected is not None
+            and 0 <= self.idx_img_movie_selected < len(self.data)
+        ):
             del self.data[self.idx_img_movie_selected]
-            self.idx_img_movie_selected = None
-        else:
-            print(f"Invalid movie image index for deletion: {self.idx_img_movie_selected}")
+        self.idx_img_movie_selected = None
         return self.get_list_images_movie()
 
     def img_movie_later(self):
-        if self.idx_img_movie_selected is not None and self.idx_img_movie_selected < len(self.data):
-            # Swap the selected image with the next one
-            self.data[self.idx_img_movie_selected], self.data[self.idx_img_movie_selected + 1] = \
-                self.data[self.idx_img_movie_selected+1], self.data[self.idx_img_movie_selected]
-            self.idx_img_movie_selected = None
-        else:
-            print("Cannot move the image later in the sequence.")
+        i = self.idx_img_movie_selected
+        if i is not None and i + 1 < len(self.data):
+            self.data[i], self.data[i + 1] = self.data[i + 1], self.data[i]
+        self.idx_img_movie_selected = None
         return self.get_list_images_movie()
 
     def img_movie_earlier(self):
-        if self.idx_img_movie_selected is not None and self.idx_img_movie_selected > 0:
-            # Swap the selected image with the previous one
-            self.data[self.idx_img_movie_selected-1], self.data[self.idx_img_movie_selected] = \
-                self.data[self.idx_img_movie_selected], self.data[self.idx_img_movie_selected-1]
-            self.idx_img_movie_selected = None
-        else:
-            print("Cannot move the image earlier in the sequence.")
+        i = self.idx_img_movie_selected
+        if i is not None and i > 0:
+            self.data[i], self.data[i - 1] = self.data[i - 1], self.data[i]
+        self.idx_img_movie_selected = None
         return self.get_list_images_movie()
-    
 
     def generate_movie(self, t_per_segment=10):
-        print("starting movie gen")
-        list_prompts = []
-        list_negative_prompts = []
-        list_seeds = []
+        prompts = [d["prompt"] for d in self.data]
+        negs = [d["negative_prompt"] for d in self.data]
+        seeds = [d["seed"] for d in self.data]
 
-        # Extract prompts, negative prompts, and seeds from the data
-        for item in self.data: 
-            list_prompts.append(item["prompt"])
-            list_negative_prompts.append(item["negative_prompt"])
-            list_seeds.append(item["seed"])
+        parts = []
 
-        list_movie_parts = []
-        for i in range(len(list_prompts) - 1):
-            # For a multi transition we can save some computation time and recycle the latents
+        for i in range(len(prompts) - 1):
             if i == 0:
-                self.be.set_prompt1(list_prompts[i])
-                self.be.set_negative_prompt(list_negative_prompts[i])
-                self.be.set_prompt2(list_prompts[i + 1])
-                recycle_img1 = False
+                self.be.set_prompt1(prompts[i])
+                self.be.set_negative_prompt(negs[i])
+                self.be.set_prompt2(prompts[i + 1])
+                recycle = False
             else:
                 self.be.swap_forward()
-                self.be.set_negative_prompt(list_negative_prompts[i+1])
-                self.be.set_prompt2(list_prompts[i + 1])
-                recycle_img1 = True
+                self.be.set_negative_prompt(negs[i + 1])
+                self.be.set_prompt2(prompts[i + 1])
+                recycle = True
 
-            fp_movie_part = f"tmp_part_{str(i).zfill(3)}.mp4"
-            fixed_seeds = list_seeds[i:i + 2]
-            # Run latent blending
+            fp = f"tmp_part_{i:03d}.mp4"
             self.be.run_transition(
-                recycle_img1=recycle_img1,
-                fixed_seeds=fixed_seeds)
+                recycle_img1=recycle,
+                fixed_seeds=seeds[i : i + 2],
+            )
+            self.be.write_movie_transition(fp, t_per_segment)
+            parts.append(fp)
 
-            # Save movie
-            self.be.write_movie_transition(fp_movie_part, t_per_segment)
-            list_movie_parts.append(fp_movie_part)
-
-        # Finally, concatenate the result
-        concatenate_movies(self.fp_movie, list_movie_parts)
-        print(f"DONE! MOVIE SAVED IN {self.fp_movie}")
+        concatenate_movies(self.fp_movie, parts)
         return self.fp_movie
 
-#%% Runtime engine
+
+# =========================
+# Runtime
+# =========================
 
 if __name__ == "__main__":
-
-    # Change Parameters below
-    parser = argparse.ArgumentParser(description="Latent Blending GUI")
-    parser.add_argument("--do_compile", type=bool, default=False)
-    parser.add_argument("--nmb_preview_images", type=int, default=4)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--do_compile", action="store_true")
     parser.add_argument("--server_name", type=str, default=None)
-    try:
-        args = parser.parse_args()
-        nmb_preview_images = args.nmb_preview_images
-        do_compile = args.do_compile
-        server_name = args.server_name
+    args = parser.parse_args()
 
-    except SystemExit:
-        # If the script is run in an interactive environment (like Jupyter), parse_args might fail.
-        nmb_preview_images = 4
-        do_compile = False # compile SD pipes with sdfast
-        server_name = None
+    mur = MultiUserRouter(do_compile=args.do_compile)
 
-    mur = MultiUserRouter(do_compile=do_compile)
     with gr.Blocks() as demo:
-        with gr.Accordion("Setup", open=True) as accordion_setup:
-            # New user registration, model selection, ...
-            with gr.Row():
-                model = gr.Dropdown(mur.list_models, value=mur.list_models[0], label="model")
-                width = gr.Slider(256, 2048, 512, step=128, label='width', interactive=True)
-                height = gr.Slider(256, 2048, 512, step=128, label='height', interactive=True)
-                user_id = gr.Textbox(label="user id (filled automatically)", interactive=False)
-                b_start_session = gr.Button('start session', variant='primary')
+        with gr.Accordion("Setup", open=True):
+            model = gr.Dropdown(mur.list_models, value=mur.list_models[0])
+            width = gr.Slider(256, 2048, 512, step=128)
+            height = gr.Slider(256, 2048, 512, step=128)
+            user_id = gr.Textbox(interactive=False)
+            b_start = gr.Button("start session", variant="primary")
 
-        with gr.Accordion("Latent Blending (expand with arrow on right side after you clicked 'start session')", open=False) as accordion_latentblending:
-            with gr.Row():
-                prompt = gr.Textbox(label="prompt")
-                negative_prompt = gr.Textbox(label="negative prompt")
-                b_compute = gr.Button('generate preview images', variant='primary')
-                b_select = gr.Button('add selected image to video', variant='primary')        
+        with gr.Accordion("Latent Blending", open=False):
+            prompt = gr.Textbox(label="prompt")
+            negative_prompt = gr.Textbox(label="negative prompt")
 
-            with gr.Row():
-                gallery_preview = gr.Gallery(
-            label="Generated images", show_label=False, elem_id="gallery"
-        , columns=[nmb_preview_images], rows=[1], object_fit="contain", height="auto", allow_preview=False, interactive=False)
+            b_compute = gr.Button("generate preview", variant="primary")
+            gallery_preview = gr.Gallery(columns=4, allow_preview=False)
+
+            b_select = gr.Button("add selected image", variant="primary")
+            gallery_movie = gr.Gallery(columns=20, allow_preview=False)
+
+            b_delete = gr.Button("delete")
+            b_earlier = gr.Button("earlier")
+            b_later = gr.Button("later")
+
+            t_per_segment = gr.Slider(1, 30, 10, step=0.1)
+            b_movie = gr.Button("generate movie", variant="primary")
+            movie = gr.Video()
+
+        b_start.click(mur.register_new_user, [model, width, height], user_id)
+        b_compute.click(mur.compute_imgs, [user_id, prompt, negative_prompt], gallery_preview)
+        gallery_preview.select(
+            mur.preview_img_selected,
+            inputs=[user_id],
+        )
+
+        gallery_movie.select(
+            mur.movie_img_selected,
+            inputs=[user_id],
+        )
+
+        b_select.click(
+            mur.add_image_to_video,
+            inputs=[user_id],
+            outputs=gallery_movie,
+        )
+
+        b_delete.click(
+            mur.img_movie_delete,
+            inputs=[user_id],
+            outputs=gallery_movie,
+        )
+
+        b_earlier.click(
+            mur.img_movie_earlier,
+            inputs=[user_id],
+            outputs=gallery_movie,
+        )
+
+        b_later.click(
+            mur.img_movie_later,
+            inputs=[user_id],
+            outputs=gallery_movie,
+        )
+
+        b_movie.click(
+        mur.generate_movie,
+        inputs=[user_id, t_per_segment],
+        outputs=movie,
+        )
 
 
-            with gr.Row():
-                gr.Markdown("Your movie contains the following images (see below)")
-            with gr.Row():
-                gallery_movie = gr.Gallery(
-            label="Generated images", show_label=False, elem_id="gallery"
-        , columns=[20], rows=[1], object_fit="contain", height="auto", allow_preview=False, interactive=False)        
-                
-            
-            with gr.Row():
-                b_delete = gr.Button('delete selected image')
-                b_move_earlier = gr.Button('move image to earlier time')
-                b_move_later = gr.Button('move image to later time')
+    demo.launch(share=True)
 
-            with gr.Row():
-                b_generate_movie = gr.Button('generate movie', variant='primary')
-                t_per_segment = gr.Slider(1, 30, 10, step=0.1, label='time per segment', interactive=True)
-
-            with gr.Row():
-                movie = gr.Video()
-
-            # bindings
-            b_start_session.click(mur.register_new_user, inputs=[model, width, height], outputs=user_id)
-            b_compute.click(mur.compute_imgs, inputs=[user_id, prompt, negative_prompt], outputs=gallery_preview)
-            b_select.click(mur.add_image_to_video, user_id, gallery_movie)
-            gallery_preview.select(mur.preview_img_selected, user_id, None)
-            gallery_movie.select(mur.movie_img_selected, user_id, None)
-            b_delete.click(mur.img_movie_delete, user_id, gallery_movie)
-            b_move_earlier.click(mur.img_movie_earlier, user_id, gallery_movie)
-            b_move_later.click(mur.img_movie_later, user_id, gallery_movie)
-            b_generate_movie.click(mur.generate_movie, [user_id, t_per_segment], movie)
-
-
-    if server_name is None:
-        demo.launch(share=False, inbrowser=True, inline=False)
-    else:
-        demo.launch(share=False, inbrowser=True, inline=False, server_name=server_name)

@@ -8,8 +8,8 @@ from PIL import Image
 from typing import List, Optional
 import lpips
 import platform
-from latentblending.diffusers_holder import DiffusersHolder
-from latentblending.utils import interpolate_spherical, interpolate_linear, add_frames_linear_interp
+from diffusers_holder import DiffusersHolder
+from utils import interpolate_spherical, interpolate_linear, add_frames_linear_interp
 from lunar_tools import MovieSaver, fill_up_frames_linear_interpolation
 warnings.filterwarnings('ignore')
 torch.backends.cudnn.benchmark = False
